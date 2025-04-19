@@ -1,29 +1,11 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import numpy as np
 import random
 from collections import deque
 import os
-import cv2
 
-# Define COMPLEX_MOVEMENT mapping
-COMPLEX_MOVEMENT = [
-    ['NOOP'],
-    ['right'],
-    ['right', 'A'],
-    ['right', 'B'],
-    ['right', 'A', 'B'],
-    ['A'],
-    ['left'],
-    ['left', 'A'],
-    ['left', 'B'],
-    ['left', 'A', 'B'],
-    ['down'],
-    ['up'],
-]
-
-# Dueling DQN architecture
+# Neural Network with Dueling Architecture
 class DuelingDQN(nn.Module):
     def __init__(self, input_shape, n_actions):
         super(DuelingDQN, self).__init__()
@@ -63,8 +45,7 @@ class DuelingDQN(nn.Module):
         value = self.value_stream(conv_out)
         advantage = self.advantage_stream(conv_out)
         
-        # Combine value and advantage to get Q-values
-        # Q(s,a) = V(s) + (A(s,a) - mean(A(s,a')))
+        # Combine value and advantage to get Q-values using the dueling formula
         return value + advantage - advantage.mean(dim=1, keepdim=True)
 
 # Main Agent Class
@@ -75,46 +56,80 @@ class Agent:
         self.input_shape = (4, 84, 84)    # 4 stacked frames, 84x84 each
         self.n_actions = 12               # COMPLEX_MOVEMENT has 12 actions
         
-        # Use Dueling DQN architecture for better performance
+        # Initialize DQN networks
         self.policy_net = DuelingDQN(self.input_shape, self.n_actions).to(self.device)
-        self.target_net = DuelingDQN(self.input_shape, self.n_actions).to(self.device)
-        self.target_net.load_state_dict(self.policy_net.state_dict())
-        self.target_net.eval()
         
         # Load model if exists
         self.load_model()
         
-        # Epsilon for exploration
-        self.epsilon = 0.05  # Low epsilon for evaluation
+        # Epsilon for exploration-exploitation trade-off
+        self.epsilon = 0.01  # Very low epsilon for evaluation
         
         # Frame processing - maintain a stack of 4 frames
         self.frame_stack = deque([np.zeros((84, 84), dtype=np.float32) for _ in range(4)], maxlen=4)
     
     def preprocess_observation(self, observation):
         """Convert and stack frames for input to DQN"""
-        # Check if observation is already processed
-        if isinstance(observation, deque) and len(observation) == 4:
-            frames = np.array(observation)
-            return frames
+        # Check if observation is already a LazyFrames object (which is what the environment returns)
+        if hasattr(observation, "_frames"):
+            # Convert LazyFrames to numpy array
+            observation = np.array(observation)
+            return observation
         
-        # Process raw observation (RGB image)
-        if len(observation.shape) == 3:  # Handle RGB image
-            # Convert to grayscale
-            gray_frame = cv2.cvtColor(observation, cv2.COLOR_RGB2GRAY) if observation.shape[2] == 3 else observation
+        # If observation is already the right shape, just return it
+        if len(observation.shape) == 3 and observation.shape[0] == 4:
+            return observation
             
-            # Resize to 84x84 if needed
+        # Handle RGB image (unlikely to reach this code with gym wrappers)
+        if len(observation.shape) == 3 and observation.shape[2] == 3:
+            # Convert to grayscale (simple average method)
+            gray_frame = np.mean(observation, axis=2).astype(np.float32)
+            
+            # Resize to 84x84 if needed using numpy
             if gray_frame.shape != (84, 84):
-                gray_frame = cv2.resize(gray_frame, (84, 84), interpolation=cv2.INTER_AREA)
+                # Simple bilinear resize using numpy
+                h, w = gray_frame.shape
+                y_indices = np.linspace(0, h-1, 84).astype(np.float32)
+                x_indices = np.linspace(0, w-1, 84).astype(np.float32)
+                
+                y_floor = np.floor(y_indices).astype(np.int32)
+                y_ceil = np.minimum(y_floor + 1, h - 1)
+                x_floor = np.floor(x_indices).astype(np.int32)
+                x_ceil = np.minimum(x_floor + 1, w - 1)
+                
+                y_frac = y_indices - y_floor
+                x_frac = x_indices - x_floor
+                
+                resized = np.zeros((84, 84), dtype=np.float32)
+                for i in range(84):
+                    for j in range(84):
+                        # Bilinear interpolation
+                        top_left = gray_frame[y_floor[i], x_floor[j]]
+                        top_right = gray_frame[y_floor[i], x_ceil[j]]
+                        bottom_left = gray_frame[y_ceil[i], x_floor[j]]
+                        bottom_right = gray_frame[y_ceil[i], x_ceil[j]]
+                        
+                        top = top_left * (1 - x_frac[j]) + top_right * x_frac[j]
+                        bottom = bottom_left * (1 - x_frac[j]) + bottom_right * x_frac[j]
+                        
+                        resized[i, j] = top * (1 - y_frac[i]) + bottom * y_frac[i]
+                        
+                gray_frame = resized
             
             # Normalize
-            normalized_frame = gray_frame.astype(np.float32) / 255.0
+            normalized_frame = gray_frame / 255.0
             
             # Update frame stack
             self.frame_stack.append(normalized_frame)
             
-        # Convert stack to numpy array for network input
-        stacked_frames = np.array(self.frame_stack)
-        return stacked_frames
+            # Convert stack to numpy array for network input
+            stacked_frames = np.array(self.frame_stack)
+            return stacked_frames
+        
+        # If we get here, the observation format is unexpected
+        # Let's try to handle it gracefully by returning a zeros array
+        print(f"Warning: Unexpected observation shape {observation.shape}")
+        return np.zeros(self.input_shape, dtype=np.float32)
     
     def act(self, observation):
         """Select action based on epsilon-greedy policy"""
@@ -132,20 +147,19 @@ class Agent:
         
         return action
     
-    def load_model(self, model_path="./checkpoints/best_mario_model.pth"):
+    def load_model(self, model_path="mario_model.pth"):
         """Load trained model if it exists"""
         if os.path.exists(model_path):
             try:
+                # Load without weights_only option
                 checkpoint = torch.load(model_path, map_location=self.device)
-                self.policy_net.load_state_dict(checkpoint['model_state_dict'])
-                self.target_net.load_state_dict(checkpoint['model_state_dict'])
+                
+                # Support both newer format (with model_state_dict) and direct state dict
+                if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+                    self.policy_net.load_state_dict(checkpoint['model_state_dict'])
+                else:
+                    self.policy_net.load_state_dict(checkpoint)
+                
                 print(f"Loaded model from {model_path}")
-                
-                # Print model info if available
-                if 'avg_reward' in checkpoint:
-                    print(f"Model average reward: {checkpoint['avg_reward']:.2f}")
-                if 'episode' in checkpoint:
-                    print(f"Model saved at episode: {checkpoint['episode']}")
-                
             except Exception as e:
                 print(f"Error loading model: {e}")
