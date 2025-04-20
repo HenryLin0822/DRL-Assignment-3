@@ -147,7 +147,7 @@ class Agent:
         
         return action
     
-    def load_model(self, model_path="mario_model.pth"):
+    def load_model(self, model_path="1300.pth"):
         """Load trained model if it exists"""
         if os.path.exists(model_path):
             try:
@@ -163,4 +163,3 @@ class Agent:
                 print(f"Loaded model from {model_path}")
             except Exception as e:
                 print(f"Error loading model: {e}")
-                
