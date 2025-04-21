@@ -5,6 +5,7 @@ import numpy as np
 import random
 from collections import deque
 import os
+from skimage import transform
 
 # Noisy Linear Layer for exploration
 class NoisyLinear(nn.Module):
@@ -51,14 +52,13 @@ class NoisyLinear(nn.Module):
         return x.sign().mul(x.abs().sqrt())
     
     def forward(self, x):
-        # For inference, we'll enable noise unlike typical evaluation
-        # This helps avoid deterministic behavior
+        # Apply noise to weights and biases
         weight = self.weight_mu + self.weight_sigma * self.weight_epsilon
         bias = self.bias_mu + self.bias_sigma * self.bias_epsilon
         
         return F.linear(x, weight, bias)
 
-# Neural Network with Dueling Architecture and Noisy Networks
+# Dueling DQN Network with Noisy Networks
 class DuelingDQN(nn.Module):
     def __init__(self, input_shape, n_actions, noisy=True):
         super(DuelingDQN, self).__init__()
@@ -119,7 +119,7 @@ class DuelingDQN(nn.Module):
         return value + advantage - advantage.mean(dim=1, keepdim=True)
     
     def reset_noise(self):
-        # Reset noise for all noisy layers - now used during inference
+        # Reset noise for all noisy layers - used during inference for exploration
         if not self.noisy:
             return
             
@@ -129,9 +129,15 @@ class DuelingDQN(nn.Module):
 
 # Main Agent Class
 class Agent:
-    def __init__(self):
+    def __init__(self, debug=False):
+        # Debug flag for printing information
+        self.debug = debug
+        
         # Initialize parameters
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        if self.debug:
+            print(f"Using device: {self.device}")
+            
         self.input_shape = (4, 84, 84)    # 4 stacked frames, 84x84 each
         self.n_actions = 12               # COMPLEX_MOVEMENT has 12 actions
         
@@ -139,233 +145,187 @@ class Agent:
         self.policy_net = DuelingDQN(self.input_shape, self.n_actions, noisy=True).to(self.device)
         self.policy_net.train()  # Keep in training mode for noise
         
-        # Load model if exists
-        self.load_model()
+        # Load model
+        self.load_model("mario_model.pth")
         
-        # Exploration parameters
-        self.epsilon = 0.05
+        # Initialize frame processing variables
+        self.reset_frame_stack()
         
-        # Initialize frame stack with zeros - crucial for handling raw observations
-        self.frame_stack = deque(maxlen=4)
-        for _ in range(4):
-            self.frame_stack.append(np.zeros((84, 84), dtype=np.float32))
+        # For exploration - use a higher epsilon for raw observations
+        self.epsilon = 0.075  # Increased from 0.05 for more exploration
         
-        # Track action history for detecting stuck behavior
-        self.action_history = deque(maxlen=10)
-        self.stuck_threshold = 5
+        # Starting sequence - improved to better handle raw environments
+        # Mix of right, jump, and run actions to build momentum
+        self.start_actions = [1, 2, 4, 1, 2, 4, 1]  # right, right+jump, right+jump+run
+        self.start_action_idx = 0
+        
+        # Frame skipping (to match training environment)
+        self.frame_skip = 4
+        self.current_frame = 0
     
-    def preprocess_frame(self, frame):
-        """Process a single frame to 84x84 grayscale normalized"""
-        try:
-            # Handle different possible frame formats
+    def reset_frame_stack(self):
+        """Initialize frame stack with empty frames"""
+        if self.debug:
+            print("Initializing frame stack")
             
-            # If already grayscale and correct size
-            if isinstance(frame, np.ndarray) and frame.shape == (84, 84):
-                # Just normalize if needed
-                if frame.dtype == np.uint8:
-                    return frame.astype(np.float32) / 255.0
-                return frame
-            
-            # If RGB frame (typical from raw environment)
-            if isinstance(frame, np.ndarray) and len(frame.shape) == 3 and frame.shape[2] == 3:
-                # Convert to grayscale using weighted average (matching human perception)
-                gray = 0.2989 * frame[:, :, 0] + 0.5870 * frame[:, :, 1] + 0.1140 * frame[:, :, 2]
-                
-                # Resize to 84x84 using numpy (avoid external dependencies)
-                h, w = gray.shape
-                if h != 84 or w != 84:
-                    # Simple resize using numpy
-                    y = np.linspace(0, h-1, 84)
-                    x = np.linspace(0, w-1, 84)
-                    
-                    # Get integer and fractional parts
-                    y_floor = np.floor(y).astype(int)
-                    y_ceil = np.minimum(y_floor + 1, h - 1)
-                    x_floor = np.floor(x).astype(int)
-                    x_ceil = np.minimum(x_floor + 1, w - 1)
-                    
-                    y_frac = y - y_floor
-                    x_frac = x - x_floor
-                    
-                    # Prepare output array
-                    resized = np.zeros((84, 84), dtype=np.float32)
-                    
-                    # Bilinear interpolation
-                    for i in range(84):
-                        for j in range(84):
-                            tl = gray[y_floor[i], x_floor[j]]
-                            tr = gray[y_floor[i], x_ceil[j]]
-                            bl = gray[y_ceil[i], x_floor[j]]
-                            br = gray[y_ceil[i], x_ceil[j]]
-                            
-                            # Calculate interpolated value
-                            resized[i, j] = (tl * (1 - x_frac[j]) * (1 - y_frac[i]) +
-                                            tr * x_frac[j] * (1 - y_frac[i]) +
-                                            bl * (1 - x_frac[j]) * y_frac[i] +
-                                            br * x_frac[j] * y_frac[i])
-                    
-                    gray = resized
-                
-                # Normalize to [0, 1]
-                return gray.astype(np.float32) / 255.0
-            
-            # If already normalized grayscale but wrong size
-            if isinstance(frame, np.ndarray) and len(frame.shape) == 2:
-                # Resize using numpy
-                h, w = frame.shape
-                if h != 84 or w != 84:
-                    # Simple resize using numpy
-                    y = np.linspace(0, h-1, 84)
-                    x = np.linspace(0, w-1, 84)
-                    
-                    # Get integer and fractional parts
-                    y_floor = np.floor(y).astype(int)
-                    y_ceil = np.minimum(y_floor + 1, h - 1)
-                    x_floor = np.floor(x).astype(int)
-                    x_ceil = np.minimum(x_floor + 1, w - 1)
-                    
-                    y_frac = y - y_floor
-                    x_frac = x - x_floor
-                    
-                    # Prepare output array
-                    resized = np.zeros((84, 84), dtype=np.float32)
-                    
-                    # Bilinear interpolation
-                    for i in range(84):
-                        for j in range(84):
-                            tl = frame[y_floor[i], x_floor[j]]
-                            tr = frame[y_floor[i], x_ceil[j]]
-                            bl = frame[y_ceil[i], x_floor[j]]
-                            br = frame[y_ceil[i], x_ceil[j]]
-                            
-                            # Calculate interpolated value
-                            resized[i, j] = (tl * (1 - x_frac[j]) * (1 - y_frac[i]) +
-                                            tr * x_frac[j] * (1 - y_frac[i]) +
-                                            bl * (1 - x_frac[j]) * y_frac[i] +
-                                            br * x_frac[j] * y_frac[i])
-                    
-                    frame = resized
-                
-                # Ensure normalized
-                if frame.max() > 1.0:
-                    return frame.astype(np.float32) / 255.0
-                return frame.astype(np.float32)
-            
-            # Special case for FrameStack observations
-            if hasattr(frame, "_frames"):
-                try:
-                    # Try to get the most recent frame
-                    single_frame = frame[-1]
-                    return self.preprocess_frame(single_frame)
-                except:
-                    pass  # Fall through to fallback
-            
-            # Fallback for unexpected formats
-            print(f"Warning: Unexpected frame format {type(frame)} with shape {getattr(frame, 'shape', 'unknown')}")
-            return np.zeros((84, 84), dtype=np.float32)
-            
-        except Exception as e:
-            print(f"Error in preprocess_frame: {e}")
-            return np.zeros((84, 84), dtype=np.float32)
+        self.frame_stack = deque(maxlen=4)
+        # Fill with black frames initially
+        empty_frame = np.zeros((84, 84), dtype=np.float32)
+        for _ in range(4):
+            self.frame_stack.append(empty_frame.copy())
     
     def preprocess_observation(self, observation):
-        """Handle either frame-stacked or raw observations"""
-        try:
-            # Case 1: Already stacked frames with shape (4, 84, 84)
-            if isinstance(observation, np.ndarray) and observation.shape == (4, 84, 84):
-                return observation
+        """Process observations to match training pipeline exactly"""
+        # Skip frames to match training environment (process every 4th frame)
+        self.current_frame = (self.current_frame + 1) % self.frame_skip
+        process_frame = (self.current_frame == 0)
+        
+        # Case 1: Already processed observations (4, 84, 84)
+        if isinstance(observation, np.ndarray) and observation.shape == (4, 84, 84):
+            if self.debug:
+                print("Case 1: Already processed observation (4, 84, 84)")
+            return observation
             
-            # Case 2: LazyFrames from FrameStack wrapper
-            if hasattr(observation, "_frames"):
+        # Case 2: LazyFrames object from FrameStack wrapper
+        if hasattr(observation, "_frames"):
+            if self.debug:
+                print("Case 2: LazyFrames object")
+            return np.array(observation)
+            
+        # Case 3: Raw RGB frame (240, 256, 3)
+        if isinstance(observation, np.ndarray) and len(observation.shape) == 3 and observation.shape[2] == 3:
+            if self.debug:
+                print(f"Case 3: Raw RGB frame {observation.shape}, process_frame={process_frame}")
+            
+            if process_frame:  # Only process every nth frame to match training
                 try:
-                    stacked = np.array(observation)
-                    if stacked.shape == (4, 84, 84):
-                        return stacked
-                except:
-                    pass  # Fall through to other cases
+                    # 1. Convert to grayscale - match exactly how training does it
+                    # Use weighted RGB to grayscale conversion (same weights used in training)
+                    gray = np.dot(observation[..., :3], [0.299, 0.587, 0.114])
+                    
+                    # 2. Crop to focus on gameplay area - removes UI elements
+                    # Adjust these values if needed based on the game
+                    cropped = gray[40:220, :]  # Remove score and status bars
+                    
+                    # 3. Resize to 84x84 using the same method as in training
+                    # Use anti_aliasing for better quality
+                    resized = transform.resize(cropped, (84, 84), anti_aliasing=True)
+                    
+                    # 4. Normalize to [0, 1] range
+                    normalized = resized.astype(np.float32)
+                    
+                    # 5. Add to frame stack
+                    self.frame_stack.append(normalized)
+                    
+                    if self.debug:
+                        print(f"Processed frame shape: {normalized.shape}")
+                        print(f"Frame min/max values: {normalized.min():.4f}/{normalized.max():.4f}")
+                except Exception as e:
+                    if self.debug:
+                        print(f"Error in preprocessing: {e}")
+                    # On error, don't update the frame stack
             
-            # Case 3: Single frame that needs to be added to our frame stack
-            # (This is likely what's happening in the submission environment)
-            
-            # Process the new frame
-            processed_frame = self.preprocess_frame(observation)
-            
-            # Add to our frame stack
-            self.frame_stack.append(processed_frame)
-            
-            # Convert deque to numpy array for the network
+            # Return the current stack regardless of whether we updated it
             stacked_frames = np.array(self.frame_stack)
             
+            if self.debug and process_frame:
+                print(f"Frame stack shape: {stacked_frames.shape}")
+                
             return stacked_frames
-            
-        except Exception as e:
-            print(f"Error in preprocess_observation: {e}")
-            # Return the existing frame stack as fallback
-            return np.array(self.frame_stack)
-    
-    def is_stuck(self):
-        """Check if the agent is repeating the same action"""
-        if len(self.action_history) < self.stuck_threshold:
-            return False
         
-        # Check if the last N actions are the same
-        return self.action_history.count(self.action_history[-1]) >= self.stuck_threshold
+        # Fallback
+        if self.debug:
+            print("Fallback case: Unknown observation format")
+        return np.array(self.frame_stack)
     
     def act(self, observation):
-        """Select action based on the current observation"""
+        """Select action based on observation"""
         try:
-            # Reset noise for the policy network
-            self.policy_net.reset_noise()
-            
-            # Preprocess the observation
+            # Check if we're in a raw environment at the start
+            if self.start_action_idx < len(self.start_actions) and isinstance(observation, np.ndarray) and len(observation.shape) == 3:
+                action = self.start_actions[self.start_action_idx]
+                if self.debug:
+                    print(f"Using start action #{self.start_action_idx}: {action}")
+                self.start_action_idx += 1
+                return action
+                
+            # Process the observation
             state = self.preprocess_observation(observation)
             
-            # Convert to tensor and get action from network
+            # Reset noise for the policy network to encourage exploration
+            self.policy_net.reset_noise()
+            
+            # Convert to tensor
             state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
             
-            # Occasionally take random actions for exploration
+            # Epsilon-greedy action selection with right-biased random actions
             if random.random() < self.epsilon:
-                action = random.randint(0, self.n_actions - 1)
-            # If stuck in a pattern, take random action
-            elif self.is_stuck():
-                action = random.randint(0, self.n_actions - 1)
-            # Otherwise use the network with active noise
+                # Random action with bias toward right movement (actions 1-4)
+                if random.random() < 0.7:  # 70% chance of right-moving action
+                    action = random.choice([1, 2, 3, 4])  # Right-moving actions
+                    if self.debug:
+                        print(f"Random RIGHT-BIASED action: {action}")
+                else:
+                    action = random.randint(0, self.n_actions - 1)
+                    if self.debug:
+                        print(f"Random action: {action}")
+                return action
             else:
+                # Model-based action
                 with torch.no_grad():
                     q_values = self.policy_net(state_tensor)
                     action = q_values.max(1)[1].item()
-            
-            # Store action in history
-            self.action_history.append(action)
-            
-            return action
-            
+                    
+                    if self.debug:
+                        print(f"Model action: {action}, Q-values min/max: {q_values.min().item():.2f}/{q_values.max().item():.2f}")
+                    
+                    # Override with right movement if model seems stuck
+                    # (e.g., repeatedly chooses non-movement actions)
+                    if action not in [1, 2, 3, 4] and random.random() < 0.2:
+                        action = random.choice([1, 2, 3, 4])
+                        if self.debug:
+                            print(f"Overriding with RIGHT action: {action}")
+                    
+                    return action
+                    
         except Exception as e:
-            print(f"Error in act method: {e}")
-            # Return right movement as fallback
-            return 1  # 'right' action
+            if self.debug:
+                print(f"ERROR in act method: {e}")
+                import traceback
+                traceback.print_exc()
+            # In case of any error, just go right
+            return 1  # right action
     
-    def load_model(self, model_path="mario_model.pth"):
+    def load_model(self, model_path):
         """Load trained model if it exists"""
         try:
             if os.path.exists(model_path):
+                if self.debug:
+                    print(f"Loading model from {model_path}")
+                    
                 # Load model
                 checkpoint = torch.load(model_path, map_location=self.device)
                 
                 # Support both formats
                 if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
                     self.policy_net.load_state_dict(checkpoint['model_state_dict'])
+                    if self.debug:
+                        print("Loaded model from checkpoint dictionary")
                 else:
                     self.policy_net.load_state_dict(checkpoint)
-                
-                print(f"Loaded model from {model_path}")
+                    if self.debug:
+                        print("Loaded model directly")
                 
                 # Keep in training mode to enable noise
                 self.policy_net.train()
+                if self.debug:
+                    print("Model loaded successfully")
                 return True
             else:
-                print(f"Warning: Model file {model_path} not found.")
+                if self.debug:
+                    print(f"Model file {model_path} not found")
                 return False
         except Exception as e:
-            print(f"Error loading model: {e}")
+            if self.debug:
+                print(f"Error loading model: {e}")
             return False
