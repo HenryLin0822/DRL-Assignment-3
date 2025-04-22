@@ -149,6 +149,7 @@ class Agent:
         self.load_model("mario_model.pth")
         
         # Initialize frame processing variables
+        self.frame_stack = deque(maxlen=4)
         self.reset_frame_stack()
         
         # For exploration - use a higher epsilon for raw observations
@@ -159,99 +160,139 @@ class Agent:
         self.start_actions = [1, 2, 4, 1, 2, 4, 1]  # right, right+jump, right+jump+run
         self.start_action_idx = 0
         
-        # Frame skipping (to match training environment)
+        # Proper frame skipping implementation
         self.frame_skip = 4
-        self.current_frame = 0
+        self.frame_count = 0
+        self.last_action = 1  # Default to 'right' action
+        
+        # Is this a fresh episode
+        self.is_first_frame = True
     
     def reset_frame_stack(self):
         """Initialize frame stack with empty frames"""
         if self.debug:
             print("Initializing frame stack")
             
-        self.frame_stack = deque(maxlen=4)
+        self.frame_stack.clear()
         # Fill with black frames initially
         empty_frame = np.zeros((84, 84), dtype=np.float32)
         for _ in range(4):
             self.frame_stack.append(empty_frame.copy())
+        
+        # Reset frame count and action
+        self.frame_count = 0
+        self.last_action = 1  # Default to 'right' action
+        self.is_first_frame = True
+    
+    def process_single_frame(self, frame):
+        """Process a single raw frame to match training preprocessing"""
+        try:
+            # 1. Convert to grayscale - match exactly how training does it
+            gray = np.dot(frame[..., :3], [0.299, 0.587, 0.114])
+            
+            # 2. Crop to focus on gameplay area - removes UI elements
+            # Note: These crop values (40:220) are crucial - must match training
+            cropped = gray[40:220, :]
+            
+            # 3. Resize to 84x84 using the same method as in training
+            # Important: using anti_aliasing=True for better quality
+            resized = transform.resize(cropped, (84, 84), anti_aliasing=True)
+            
+            # 4. Normalize to [0, 1] range
+            normalized = resized.astype(np.float32)
+            
+            return normalized
+            
+        except Exception as e:
+            if self.debug:
+                print(f"Error processing frame: {e}")
+            # Return empty frame on error
+            return np.zeros((84, 84), dtype=np.float32)
     
     def preprocess_observation(self, observation):
         """Process observations to match training pipeline exactly"""
-        # Skip frames to match training environment (process every 4th frame)
-        self.current_frame = (self.current_frame + 1) % self.frame_skip
-        process_frame = (self.current_frame == 0)
-        
         # Case 1: Already processed observations (4, 84, 84)
         if isinstance(observation, np.ndarray) and observation.shape == (4, 84, 84):
             if self.debug:
                 print("Case 1: Already processed observation (4, 84, 84)")
+            self.is_first_frame = False
             return observation
             
         # Case 2: LazyFrames object from FrameStack wrapper
         if hasattr(observation, "_frames"):
             if self.debug:
                 print("Case 2: LazyFrames object")
+            self.is_first_frame = False
             return np.array(observation)
             
         # Case 3: Raw RGB frame (240, 256, 3)
         if isinstance(observation, np.ndarray) and len(observation.shape) == 3 and observation.shape[2] == 3:
-            if self.debug:
-                print(f"Case 3: Raw RGB frame {observation.shape}, process_frame={process_frame}")
-            
-            if process_frame:  # Only process every nth frame to match training
-                try:
-                    # 1. Convert to grayscale - match exactly how training does it
-                    # Use weighted RGB to grayscale conversion (same weights used in training)
-                    gray = np.dot(observation[..., :3], [0.299, 0.587, 0.114])
-                    
-                    # 2. Crop to focus on gameplay area - removes UI elements
-                    # Adjust these values if needed based on the game
-                    cropped = gray[40:220, :]  # Remove score and status bars
-                    
-                    # 3. Resize to 84x84 using the same method as in training
-                    # Use anti_aliasing for better quality
-                    resized = transform.resize(cropped, (84, 84), anti_aliasing=True)
-                    
-                    # 4. Normalize to [0, 1] range
-                    normalized = resized.astype(np.float32)
-                    
-                    # 5. Add to frame stack
-                    self.frame_stack.append(normalized)
-                    
-                    if self.debug:
-                        print(f"Processed frame shape: {normalized.shape}")
-                        print(f"Frame min/max values: {normalized.min():.4f}/{normalized.max():.4f}")
-                except Exception as e:
-                    if self.debug:
-                        print(f"Error in preprocessing: {e}")
-                    # On error, don't update the frame stack
-            
-            # Return the current stack regardless of whether we updated it
-            stacked_frames = np.array(self.frame_stack)
-            
-            if self.debug and process_frame:
-                print(f"Frame stack shape: {stacked_frames.shape}")
+            # Handle first frame specially - fill the entire stack with first frame
+            if self.is_first_frame:
+                if self.debug:
+                    print("Processing first frame of episode")
                 
-            return stacked_frames
+                # Process the frame
+                processed_frame = self.process_single_frame(observation)
+                
+                # Fill the entire stack with this first frame
+                self.frame_stack.clear()
+                for _ in range(4):
+                    self.frame_stack.append(processed_frame.copy())
+                
+                self.is_first_frame = False
+                
+                if self.debug:
+                    print(f"Initialized frame stack with first frame, shape: {processed_frame.shape}")
+            else:
+                # Process and add new frame to stack
+                processed_frame = self.process_single_frame(observation)
+                self.frame_stack.append(processed_frame)
+                
+                if self.debug:
+                    print(f"Added frame to stack, count: {self.frame_count}")
+            
+            # Increment frame counter for skipping
+            self.frame_count = (self.frame_count + 1) % self.frame_skip
+            
+            # Return the current stack
+            return np.array(self.frame_stack)
         
         # Fallback
         if self.debug:
             print("Fallback case: Unknown observation format")
         return np.array(self.frame_stack)
     
+    def should_select_new_action(self):
+        """Determine if we should select a new action or reuse the last one."""
+        # Always select a new action on the first frame
+        if self.is_first_frame:
+            return True
+            
+        # Only select new action every frame_skip frames
+        return self.frame_count == 0
+    
     def act(self, observation):
         """Select action based on observation"""
         try:
-            # Check if we're in a raw environment at the start
+            # Process the observation
+            state = self.preprocess_observation(observation)
+            
+            # For raw observations at the start of an episode, use predetermined actions
             if self.start_action_idx < len(self.start_actions) and isinstance(observation, np.ndarray) and len(observation.shape) == 3:
                 action = self.start_actions[self.start_action_idx]
                 if self.debug:
                     print(f"Using start action #{self.start_action_idx}: {action}")
                 self.start_action_idx += 1
+                self.last_action = action
                 return action
-                
-            # Process the observation
-            state = self.preprocess_observation(observation)
             
+            # Decide whether to select a new action or reuse previous
+            if not self.should_select_new_action():
+                if self.debug:
+                    print(f"Reusing action: {self.last_action} (frame {self.frame_count} of {self.frame_skip})")
+                return self.last_action
+                
             # Reset noise for the policy network to encourage exploration
             self.policy_net.reset_noise()
             
@@ -261,7 +302,7 @@ class Agent:
             # Epsilon-greedy action selection with right-biased random actions
             if random.random() < self.epsilon:
                 # Random action with bias toward right movement (actions 1-4)
-                if random.random() < 0.7:  # 70% chance of right-moving action
+                if random.random() < 0.8:  # 80% chance of right-moving action (increased from 70%)
                     action = random.choice([1, 2, 3, 4])  # Right-moving actions
                     if self.debug:
                         print(f"Random RIGHT-BIASED action: {action}")
@@ -269,7 +310,6 @@ class Agent:
                     action = random.randint(0, self.n_actions - 1)
                     if self.debug:
                         print(f"Random action: {action}")
-                return action
             else:
                 # Model-based action
                 with torch.no_grad():
@@ -285,8 +325,10 @@ class Agent:
                         action = random.choice([1, 2, 3, 4])
                         if self.debug:
                             print(f"Overriding with RIGHT action: {action}")
-                    
-                    return action
+            
+            # Store the selected action for reuse
+            self.last_action = action
+            return action
                     
         except Exception as e:
             if self.debug:
@@ -294,7 +336,9 @@ class Agent:
                 import traceback
                 traceback.print_exc()
             # In case of any error, just go right
-            return 1  # right action
+            action = 1  # right action
+            self.last_action = action
+            return action
     
     def load_model(self, model_path):
         """Load trained model if it exists"""
