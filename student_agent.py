@@ -153,11 +153,12 @@ class Agent:
         self.reset_frame_stack()
         
         # For exploration - use a higher epsilon for raw observations
-        self.epsilon = 0.075  # Increased from 0.05 for more exploration
+        self.epsilon = 0.01  # Low epsilon to trust the model more
         
         # Starting sequence - improved to better handle raw environments
         # Mix of right, jump, and run actions to build momentum
-        self.start_actions = [1, 2, 4, 1, 2, 4, 1]  # right, right+jump, right+jump+run
+        # 1=right, 2=right+jump, 4=right+jump+run
+        self.start_actions = [1, 2, 4, 1, 2, 4, 2, 4, 2]  # Effective starting sequence
         self.start_action_idx = 0
         
         # Proper frame skipping implementation
@@ -167,6 +168,10 @@ class Agent:
         
         # Is this a fresh episode
         self.is_first_frame = True
+        
+        # Track consecutive non-right actions to prevent getting stuck
+        self.non_right_count = 0
+        self.max_non_right = 5  # Max consecutive non-right actions before overriding
     
     def reset_frame_stack(self):
         """Initialize frame stack with empty frames"""
@@ -183,6 +188,7 @@ class Agent:
         self.frame_count = 0
         self.last_action = 1  # Default to 'right' action
         self.is_first_frame = True
+        self.non_right_count = 0
     
     def process_single_frame(self, frame):
         """Process a single raw frame to match training preprocessing"""
@@ -190,15 +196,11 @@ class Agent:
             # 1. Convert to grayscale - match exactly how training does it
             gray = np.dot(frame[..., :3], [0.299, 0.587, 0.114])
             
-            # 2. Crop to focus on gameplay area - removes UI elements
-            # Note: These crop values (40:220) are crucial - must match training
-            cropped = gray[40:220, :]
+            # 2. Resize to 84x84 using the same method as in training
+            # Important: using anti_aliasing=False for better matching
+            resized = transform.resize(gray, (84, 84), anti_aliasing=False)
             
-            # 3. Resize to 84x84 using the same method as in training
-            # Important: using anti_aliasing=True for better quality
-            resized = transform.resize(cropped, (84, 84), anti_aliasing=True)
-            
-            # 4. Normalize to [0, 1] range
+            # 3. Normalize to [0, 1] range
             normalized = resized.astype(np.float32)
             
             return normalized
@@ -245,12 +247,14 @@ class Agent:
                 if self.debug:
                     print(f"Initialized frame stack with first frame, shape: {processed_frame.shape}")
             else:
-                # Process and add new frame to stack
-                processed_frame = self.process_single_frame(observation)
-                self.frame_stack.append(processed_frame)
-                
-                if self.debug:
-                    print(f"Added frame to stack, count: {self.frame_count}")
+                # Only update stack every frame_skip frames to match training
+                if self.frame_count == 0:
+                    # Process and add new frame to stack
+                    processed_frame = self.process_single_frame(observation)
+                    self.frame_stack.append(processed_frame)
+                    
+                    if self.debug:
+                        print(f"Added frame to stack, count: {len(self.frame_stack)}")
             
             # Increment frame counter for skipping
             self.frame_count = (self.frame_count + 1) % self.frame_skip
@@ -299,32 +303,52 @@ class Agent:
             # Convert to tensor
             state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
             
-            # Epsilon-greedy action selection with right-biased random actions
-            if random.random() < self.epsilon:
-                # Random action with bias toward right movement (actions 1-4)
-                if random.random() < 0.8:  # 80% chance of right-moving action (increased from 70%)
-                    action = random.choice([1, 2, 3, 4])  # Right-moving actions
-                    if self.debug:
-                        print(f"Random RIGHT-BIASED action: {action}")
+            # Get action from model
+            with torch.no_grad():
+                q_values = self.policy_net(state_tensor)
+                model_action = q_values.max(1)[1].item()
+            
+            # Handle raw observations differently
+            if isinstance(observation, np.ndarray) and len(observation.shape) == 3:
+                # Epsilon-greedy action selection with right-biased random actions
+                if random.random() < self.epsilon:
+                    # Random action with bias toward right movement (actions 1-4)
+                    if random.random() < 0.8:  # 80% chance of right-moving action
+                        action = random.choice([1, 2, 4])  # Right-moving actions
+                        if self.debug:
+                            print(f"Random RIGHT-BIASED action: {action}")
+                    else:
+                        action = random.randint(0, self.n_actions - 1)
+                        if self.debug:
+                            print(f"Random action: {action}")
                 else:
-                    action = random.randint(0, self.n_actions - 1)
-                    if self.debug:
-                        print(f"Random action: {action}")
-            else:
-                # Model-based action
-                with torch.no_grad():
-                    q_values = self.policy_net(state_tensor)
-                    action = q_values.max(1)[1].item()
+                    # Model-based action
+                    action = model_action
                     
                     if self.debug:
                         print(f"Model action: {action}, Q-values min/max: {q_values.min().item():.2f}/{q_values.max().item():.2f}")
                     
+                    # Track non-right actions
+                    if action not in [1, 2, 3, 4]:
+                        self.non_right_count += 1
+                    else:
+                        self.non_right_count = 0
+                    
                     # Override with right movement if model seems stuck
-                    # (e.g., repeatedly chooses non-movement actions)
-                    if action not in [1, 2, 3, 4] and random.random() < 0.2:
-                        action = random.choice([1, 2, 3, 4])
+                    if self.non_right_count >= self.max_non_right:
+                        action = random.choice([1, 2, 4])  # Force right action
+                        self.non_right_count = 0
                         if self.debug:
-                            print(f"Overriding with RIGHT action: {action}")
+                            print(f"Overriding with RIGHT action: {action} after {self.max_non_right} non-right actions")
+                    
+                    # Safety override - prefer jump in many cases to avoid pits
+                    if action == 1 and random.random() < 0.3:  # 30% chance to convert right to right+jump
+                        action = 2  # right+jump
+                        if self.debug:
+                            print(f"Safety override: converted right to right+jump")
+            else:
+                # For preprocessed observations, trust the model more
+                action = model_action
             
             # Store the selected action for reuse
             self.last_action = action
@@ -373,4 +397,3 @@ class Agent:
             if self.debug:
                 print(f"Error loading model: {e}")
             return False
-    
