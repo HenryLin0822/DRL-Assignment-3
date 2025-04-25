@@ -147,7 +147,10 @@ class Agent:
         
         # Load model
         self.load_model("mario_model.pth")
-        
+        #self.load_model("mario_model2.pth")
+        #self.load_model("1700.pth")
+        #self.load_model("./checkpoints/best_processed_mario_model.pth")
+        #self.load_model("./checkpoints/best_raw_mario_model.pth")
         # Initialize frame processing variables
         self.frame_stack = deque(maxlen=4)
         self.reset_frame_stack()
@@ -171,7 +174,7 @@ class Agent:
         
         # Track consecutive non-right actions to prevent getting stuck
         self.non_right_count = 0
-        self.max_non_right = 5  # Max consecutive non-right actions before overriding
+        self.max_non_right = 8  # Max consecutive non-right actions before overriding
     
     def reset_frame_stack(self):
         """Initialize frame stack with empty frames"""
