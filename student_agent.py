@@ -189,31 +189,32 @@ class Agent:
         
         # Reset frame count and action
         self.frame_count = 0
-        self.last_action = 1  # Default to 'right' action
+        self.last_action = 2  # Default to 'right' action
         self.is_first_frame = True
         self.non_right_count = 0
     
     def process_single_frame(self, frame):
-        """Process a single raw frame to match training preprocessing"""
+        """Process a single raw frame to exactly match training preprocessing"""
         try:
-            # 1. Convert to grayscale - match exactly how training does it
-            gray = np.dot(frame[..., :3], [0.299, 0.587, 0.114])
+            # 1. Convert to grayscale using OpenCV (like GrayScaleObservation)
+            import cv2
+            gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
             
             # 2. Resize to 84x84 using the same method as in training
-            # Important: using anti_aliasing=False for better matching
-            resized = transform.resize(gray, (84, 84), anti_aliasing=False)
+            resized = transform.resize(gray, (84, 84))
+            resized *= 255
+            resized = resized.astype(np.uint8)
             
-            # 3. Normalize to [0, 1] range
-            normalized = resized.astype(np.float32)
+            # 3. Normalize to [0, 1] range (like TransformObservation)
+            normalized = resized / 255.0
             
-            return normalized
+            return normalized.astype(np.float32)
             
         except Exception as e:
             if self.debug:
                 print(f"Error processing frame: {e}")
             # Return empty frame on error
             return np.zeros((84, 84), dtype=np.float32)
-    
     def preprocess_observation(self, observation):
         """Process observations to match training pipeline exactly"""
         # Case 1: Already processed observations (4, 84, 84)
@@ -282,6 +283,18 @@ class Agent:
     def act(self, observation):
         """Select action based on observation"""
         try:
+            if self.is_first_frame:
+                self.reset_frame_stack()
+                self.last_observation = observation
+                self.skip_observation = observation
+                self.is_first_frame = False
+                self.frame_count = 0
+                
+                # Always start with right+jump (action index 2) after death/reset
+                self.last_action = 2  # right+jump action
+                if self.debug:
+                    print("Starting new episode with right+jump action")
+                return 2  # right+jump action
             # Process the observation
             state = self.preprocess_observation(observation)
             
@@ -309,50 +322,37 @@ class Agent:
             # Get action from model
             with torch.no_grad():
                 q_values = self.policy_net(state_tensor)
-                model_action = q_values.max(1)[1].item()
+                action = q_values.max(1)[1].item()
+
             
-            # Handle raw observations differently
-            if isinstance(observation, np.ndarray) and len(observation.shape) == 3:
-                # Epsilon-greedy action selection with right-biased random actions
-                if random.random() < self.epsilon:
-                    # Random action with bias toward right movement (actions 1-4)
-                    if random.random() < 0.8:  # 80% chance of right-moving action
-                        action = random.choice([1, 2, 4])  # Right-moving actions
-                        if self.debug:
-                            print(f"Random RIGHT-BIASED action: {action}")
-                    else:
-                        action = random.randint(0, self.n_actions - 1)
-                        if self.debug:
-                            print(f"Random action: {action}")
-                else:
-                    # Model-based action
-                    action = model_action
-                    
+            if random.random() < self.epsilon:
+                # Random action with bias toward right movement (actions 1-4)
+                if random.random() < 0.9:  # 80% chance of right-moving action
+                    action = random.choice([ 2, 4])  # Right-moving actions
                     if self.debug:
-                        print(f"Model action: {action}, Q-values min/max: {q_values.min().item():.2f}/{q_values.max().item():.2f}")
-                    
-                    # Track non-right actions
-                    if action not in [1, 2, 3, 4]:
-                        self.non_right_count += 1
-                    else:
-                        self.non_right_count = 0
-                    
-                    # Override with right movement if model seems stuck
-                    if self.non_right_count >= self.max_non_right:
-                        action = random.choice([1, 2, 4])  # Force right action
-                        self.non_right_count = 0
-                        if self.debug:
-                            print(f"Overriding with RIGHT action: {action} after {self.max_non_right} non-right actions")
-                    
-                    # Safety override - prefer jump in many cases to avoid pits
-                    if action == 1 and random.random() < 0.3:  # 30% chance to convert right to right+jump
-                        action = 2  # right+jump
-                        if self.debug:
-                            print(f"Safety override: converted right to right+jump")
+                        print(f"Random RIGHT-BIASED action: {action}")
+                else:
+                    action = random.randint(0, self.n_actions - 1)
+                    if self.debug:
+                        print(f"Random action: {action}")
             else:
-                # For preprocessed observations, trust the model more
-                action = model_action
-            
+
+                
+                if self.debug:
+                    print(f"Model action: {action}, Q-values min/max: {q_values.min().item():.2f}/{q_values.max().item():.2f}")
+                
+                # Track non-right actions
+                if action not in [ 2, 4]:
+                    self.non_right_count += 1
+                else:
+                    self.non_right_count = 0
+                
+                # Override with right movement if model seems stuck
+                if self.non_right_count >= self.max_non_right:
+                    action = random.choice([2, 4])  # Force right action
+                    self.non_right_count = 0
+                    if self.debug:
+                        print(f"Overriding with RIGHT action: {action} after {self.max_non_right} non-right actions")
             # Store the selected action for reuse
             self.last_action = action
             return action
