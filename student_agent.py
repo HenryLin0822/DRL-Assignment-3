@@ -194,19 +194,21 @@ class Agent:
         self.non_right_count = 0
     
     def process_single_frame(self, frame):
-        """Process a single raw frame to match training preprocessing"""
+        """Process a single raw frame to exactly match training preprocessing"""
         try:
-            # 1. Convert to grayscale - match exactly how training does it
-            gray = np.dot(frame[..., :3], [0.299, 0.587, 0.114])
+            # 1. Convert to grayscale using OpenCV (like GrayScaleObservation)
+            import cv2
+            gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
             
             # 2. Resize to 84x84 using the same method as in training
-            # Important: using anti_aliasing=False for better matching
-            resized = transform.resize(gray, (84, 84), anti_aliasing=False)
+            resized = transform.resize(gray, (84, 84))
+            resized *= 255
+            resized = resized.astype(np.uint8)
             
-            # 3. Normalize to [0, 1] range
-            normalized = resized.astype(np.float32)
+            # 3. Normalize to [0, 1] range (like TransformObservation)
+            normalized = resized / 255.0
             
-            return normalized
+            return normalized.astype(np.float32)
             
         except Exception as e:
             if self.debug:
