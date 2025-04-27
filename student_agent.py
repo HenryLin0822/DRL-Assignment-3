@@ -146,10 +146,10 @@ class Agent:
         self.policy_net.train()  # Keep in training mode for noise
         
         # Load model
-        #self.load_model("mario_model.pth")
+        self.load_model("mario_model.pth")
         #self.load_model("mario_model2.pth")
         #self.load_model("1700.pth")
-        self.load_model("./checkpoints/best_processed_mario_model.pth")
+        #self.load_model("./checkpoints/best_processed_mario_model.pth")
         #self.load_model("./checkpoints/best_raw_mario_model.pth")
         # Initialize frame processing variables
         self.frame_stack = deque(maxlen=4)
