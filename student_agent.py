@@ -3,9 +3,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 import random
+import cv2
 from collections import deque
 import os
-from skimage import transform
 
 # Noisy Linear Layer for exploration
 class NoisyLinear(nn.Module):
@@ -147,10 +147,7 @@ class Agent:
         
         # Load model
         self.load_model("mario_model.pth")
-        #self.load_model("mario_model2.pth")
-        #self.load_model("1700.pth")
-        #self.load_model("./checkpoints/best_processed_mario_model.pth")
-        #self.load_model("./checkpoints/best_raw_mario_model.pth")
+        
         # Initialize frame processing variables
         self.frame_stack = deque(maxlen=4)
         self.reset_frame_stack()
@@ -182,34 +179,32 @@ class Agent:
             print("Initializing frame stack")
             
         self.frame_stack.clear()
-        # Fill with black frames initially
-        empty_frame = np.zeros((84, 84), dtype=np.float32)
+        # Fill with zeros initially - match the right shape (C,H,W)
+        empty_frame = np.zeros((1, 84, 84), dtype=np.float32)
         for _ in range(4):
             self.frame_stack.append(empty_frame.copy())
         
         # Reset frame count and action
         self.frame_count = 0
-        self.last_action = 2  # Default to 'right' action
+        self.last_action = 2  # Default to right+jump action
         self.is_first_frame = True
         self.non_right_count = 0
     
     def process_single_frame(self, frame):
         """Process a single raw frame to exactly match training preprocessing"""
-
-        import cv2
+        # Match FrameDownsample wrapper
         gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
+        resized = cv2.resize(gray, (84, 84), interpolation=cv2.INTER_AREA)
+        resized = resized[:, :, None]  # Add channel dimension (H,W,C)
         
-        # 2. Resize to 84x84 using the same method as in training
-        resized = transform.resize(gray, (84, 84))
-        resized *= 255
-        resized = resized.astype(np.uint8)
+        # Match ImageToPyTorch wrapper
+        processed = np.moveaxis(resized, 2, 0)  # Change from (H,W,C) to (C,H,W)
         
-        # 3. Normalize to [0, 1] range (like TransformObservation)
-        normalized = resized / 255.0
+        # Match NormalizeFloats wrapper
+        normalized = processed.astype(np.float32) / 255.0
         
-        return normalized.astype(np.float32)
-            
-
+        return normalized
+    
     def preprocess_observation(self, observation):
         """Process observations to match training pipeline exactly"""
         # Case 1: Already processed observations (4, 84, 84)
@@ -258,13 +253,14 @@ class Agent:
             # Increment frame counter for skipping
             self.frame_count = (self.frame_count + 1) % self.frame_skip
             
-            # Return the current stack
-            return np.array(self.frame_stack)
+            # Convert frame stack to correctly stacked array
+            stacked_frames = np.vstack(self.frame_stack)
+            return stacked_frames
         
         # Fallback
         if self.debug:
             print("Fallback case: Unknown observation format")
-        return np.array(self.frame_stack)
+        return np.vstack(self.frame_stack)
     
     def should_select_new_action(self):
         """Determine if we should select a new action or reuse the last one."""
@@ -290,6 +286,7 @@ class Agent:
                 if self.debug:
                     print("Starting new episode with right+jump action")
                 return 2  # right+jump action
+            
             # Process the observation
             state = self.preprocess_observation(observation)
             
@@ -318,12 +315,11 @@ class Agent:
             with torch.no_grad():
                 q_values = self.policy_net(state_tensor)
                 action = q_values.max(1)[1].item()
-
             
             if random.random() < self.epsilon:
                 # Random action with bias toward right movement (actions 1-4)
-                if random.random() < 0.9:  # 80% chance of right-moving action
-                    action = random.choice([ 2, 4])  # Right-moving actions
+                if random.random() < 0.9:  # 90% chance of right-moving action
+                    action = random.choice([2, 4])  # Right-moving actions
                     if self.debug:
                         print(f"Random RIGHT-BIASED action: {action}")
                 else:
@@ -331,13 +327,11 @@ class Agent:
                     if self.debug:
                         print(f"Random action: {action}")
             else:
-
-                
                 if self.debug:
                     print(f"Model action: {action}, Q-values min/max: {q_values.min().item():.2f}/{q_values.max().item():.2f}")
                 
                 # Track non-right actions
-                if action not in [ 2, 4]:
+                if action not in [2, 4]:
                     self.non_right_count += 1
                 else:
                     self.non_right_count = 0
@@ -348,6 +342,7 @@ class Agent:
                     self.non_right_count = 0
                     if self.debug:
                         print(f"Overriding with RIGHT action: {action} after {self.max_non_right} non-right actions")
+            
             # Store the selected action for reuse
             self.last_action = action
             return action
@@ -395,4 +390,3 @@ class Agent:
             if self.debug:
                 print(f"Error loading model: {e}")
             return False
-        
