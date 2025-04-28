@@ -3,9 +3,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 import random
-import cv2
 from collections import deque
 import os
+from skimage import transform
+import cv2
 
 # Noisy Linear Layer for exploration
 class NoisyLinear(nn.Module):
@@ -147,10 +148,7 @@ class Agent:
         
         # Load model
         self.load_model("mario_model.pth")
-        
-        # Initialize frame processing variables
-        self.frame_stack = deque(maxlen=4)
-        self.reset_frame_stack()
+        #self.load_model("./checkpoints/best_processed_mario_model.pth")
         
         # For exploration - use a higher epsilon for raw observations
         self.epsilon = 0.01  # Low epsilon to trust the model more
@@ -161,201 +159,231 @@ class Agent:
         self.start_actions = [1, 2, 4, 1, 2, 4, 2, 4, 2]  # Effective starting sequence
         self.start_action_idx = 0
         
-        # Proper frame skipping implementation
+        # Frame skipping settings
         self.frame_skip = 4
-        self.frame_count = 0
-        self.last_action = 1  # Default to 'right' action
+        self.step_counter = 0  # Count all env steps for proper action timing
+        self.action_counter = 0  # Count actions selected
+        self.frame_count = 0   # Count frames for raw observation handling
         
-        # Is this a fresh episode
+        # Action selection
+        self.current_action = 1  # Default to 'right' action
+        self.last_action = 1
+        
+        # Episode tracking
         self.is_first_frame = True
         
         # Track consecutive non-right actions to prevent getting stuck
         self.non_right_count = 0
         self.max_non_right = 8  # Max consecutive non-right actions before overriding
+        
+        # Frame stacking
+        self.initialize_frame_stacks()
     
-    def reset_frame_stack(self):
-        """Initialize frame stack with empty frames"""
-        if self.debug:
-            print("Initializing frame stack")
-            
-        self.frame_stack.clear()
-        # Fill with zeros initially - match the right shape (C,H,W)
-        empty_frame = np.zeros((1, 84, 84), dtype=np.float32)
+    def initialize_frame_stacks(self):
+        """Initialize frame stacks for both raw and processed observations"""
+        # For raw observation processing
+        self.frame_stack = deque(maxlen=4)  # Final processed stack
+        
+        # Fill with black frames initially
+        empty_frame = np.zeros((84, 84), dtype=np.float32)
         for _ in range(4):
             self.frame_stack.append(empty_frame.copy())
-        
-        # Reset frame count and action
+    
+    def reset_frame_stack(self):
+        """Reset frame stacks at the beginning of each episode"""
+        # Reset counters
+        self.step_counter = 0
+        self.action_counter = 0
         self.frame_count = 0
-        self.last_action = 2  # Default to right+jump action
+        
+        # Reset actions
+        self.current_action = 1
+        self.last_action = 1
+        
+        # Reset episode state
         self.is_first_frame = True
+        self.start_action_idx = 0
         self.non_right_count = 0
+        
+        # Reinitialize frame stacks
+        self.initialize_frame_stacks()
     
     def process_single_frame(self, frame):
-        """Process a single raw frame to exactly match training preprocessing"""
-        # Match FrameDownsample wrapper
+        """
+        Process a single raw frame to exactly match training preprocessing
+        Ensures bit-identical output to the wrapper pipeline
+        """
+        # 1. Convert RGB to grayscale using OpenCV (same as GrayScaleObservation)
         gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
-        resized = cv2.resize(gray, (84, 84), interpolation=cv2.INTER_AREA)
-        resized = resized[:, :, None]  # Add channel dimension (H,W,C)
         
-        # Match ImageToPyTorch wrapper
-        processed = np.moveaxis(resized, 2, 0)  # Change from (H,W,C) to (C,H,W)
+        # 2. Resize to 84x84 using skimage.transform (same as ResizeObservation wrapper)
+        resized = transform.resize(gray, (84, 84))
+        resized *= 255
+        resized = resized.astype(np.uint8)
         
-        # Match NormalizeFloats wrapper
-        normalized = processed.astype(np.float32) / 255.0
+        # 3. Normalize to [0, 1] range (same as TransformObservation)
+        normalized = resized / 255.0
         
-        return normalized
-    
+        # Return as float32 for PyTorch compatibility
+        return normalized.astype(np.float32)
+            
     def preprocess_observation(self, observation):
         """Process observations to match training pipeline exactly"""
         # Case 1: Already processed observations (4, 84, 84)
         if isinstance(observation, np.ndarray) and observation.shape == (4, 84, 84):
             if self.debug:
                 print("Case 1: Already processed observation (4, 84, 84)")
-            self.is_first_frame = False
             return observation
             
         # Case 2: LazyFrames object from FrameStack wrapper
         if hasattr(observation, "_frames"):
             if self.debug:
                 print("Case 2: LazyFrames object")
-            self.is_first_frame = False
             return np.array(observation)
             
         # Case 3: Raw RGB frame (240, 256, 3)
         if isinstance(observation, np.ndarray) and len(observation.shape) == 3 and observation.shape[2] == 3:
-            # Handle first frame specially - fill the entire stack with first frame
+            # Process the current frame
+            processed_frame = self.process_single_frame(observation)
+            
+            # Handle first frame specially (fill whole stack with first frame)
             if self.is_first_frame:
                 if self.debug:
                     print("Processing first frame of episode")
                 
-                # Process the frame
-                processed_frame = self.process_single_frame(observation)
-                
-                # Fill the entire stack with this first frame
+                # Initialize the entire stack with the first processed frame
                 self.frame_stack.clear()
                 for _ in range(4):
                     self.frame_stack.append(processed_frame.copy())
                 
                 self.is_first_frame = False
-                
-                if self.debug:
-                    print(f"Initialized frame stack with first frame, shape: {processed_frame.shape}")
+                self.frame_count = 0
             else:
-                # Only update stack every frame_skip frames to match training
-                if self.frame_count == 0:
-                    # Process and add new frame to stack
-                    processed_frame = self.process_single_frame(observation)
-                    self.frame_stack.append(processed_frame)
-                    
-                    if self.debug:
-                        print(f"Added frame to stack, count: {len(self.frame_stack)}")
+                # We update the stack with new processed frame every time for raw observations
+                # But we only use it for decision making every frame_skip steps
+                self.frame_stack.append(processed_frame)
             
-            # Increment frame counter for skipping
-            self.frame_count = (self.frame_count + 1) % self.frame_skip
+            # Increment raw frame counter 
+            self.frame_count += 1
             
-            # Convert frame stack to correctly stacked array
-            stacked_frames = np.vstack(self.frame_stack)
+            # Return stacked frames in the correct format for the neural network (4, 84, 84)
+            stacked_frames = np.array(self.frame_stack)
             return stacked_frames
         
-        # Fallback
+        # Fallback for any unexpected observation format
         if self.debug:
             print("Fallback case: Unknown observation format")
-        return np.vstack(self.frame_stack)
+        return np.array(self.frame_stack)
     
     def should_select_new_action(self):
-        """Determine if we should select a new action or reuse the last one."""
-        # Always select a new action on the first frame
+        """
+        Determine if we should select a new action or reuse the current one.
+        For raw observations, we select a new action every frame_skip steps.
+        For processed observations, we select a new action every step.
+        """
+        # For processed observations (already skipped at the env level), always select new action
         if self.is_first_frame:
             return True
             
-        # Only select new action every frame_skip frames
-        return self.frame_count == 0
+        # For raw observations, only select new action every frame_skip frames
+        if self.frame_count % self.frame_skip == 0:
+            return True
+            
+        return False
     
     def act(self, observation):
-        """Select action based on observation"""
-        try:
-            if self.is_first_frame:
-                self.reset_frame_stack()
-                self.last_observation = observation
-                self.skip_observation = observation
-                self.is_first_frame = False
-                self.frame_count = 0
-                
-                # Always start with right+jump (action index 2) after death/reset
-                self.last_action = 2  # right+jump action
-                if self.debug:
-                    print("Starting new episode with right+jump action")
-                return 2  # right+jump action
+        """
+        Select action based on observation.
+        Handles both raw and processed observations with consistent behavior.
+        """
+       
+        # Process the observation first to get proper state for the neural network
+        state = self.preprocess_observation(observation)
+        
+        # First frame of episode special handling
+        if self.is_first_frame:
+            self.reset_frame_stack()
+            self.is_first_frame = False
             
-            # Process the observation
-            state = self.preprocess_observation(observation)
-            
-            # For raw observations at the start of an episode, use predetermined actions
-            if self.start_action_idx < len(self.start_actions) and isinstance(observation, np.ndarray) and len(observation.shape) == 3:
+            # Always start with right (action index 1) after death/reset
+            self.current_action = 1  # right action
+            self.last_action = 1
+            if self.debug:
+                print("Starting new episode with right action")
+            return 1  # right action
+        
+        # Decide whether to select a new action or reuse previous one
+        if not self.should_select_new_action():
+            if self.debug:
+                print(f"Reusing action {self.current_action} (frame {self.frame_count % self.frame_skip} of {self.frame_skip})")
+            return self.current_action
+        
+        # For raw observations at the start of an episode, use predetermined actions
+        if isinstance(observation, np.ndarray) and len(observation.shape) == 3 and observation.shape[2] == 3:
+            if self.start_action_idx < len(self.start_actions):
                 action = self.start_actions[self.start_action_idx]
                 if self.debug:
                     print(f"Using start action #{self.start_action_idx}: {action}")
                 self.start_action_idx += 1
                 self.last_action = action
+                self.current_action = action
                 return action
-            
-            # Decide whether to select a new action or reuse previous
-            if not self.should_select_new_action():
-                if self.debug:
-                    print(f"Reusing action: {self.last_action} (frame {self.frame_count} of {self.frame_skip})")
-                return self.last_action
-                
-            # Reset noise for the policy network to encourage exploration
-            self.policy_net.reset_noise()
-            
-            # Convert to tensor
+        
+        # Reset noise for the policy network to encourage exploration
+        self.policy_net.reset_noise()
+        
+        # Convert to tensor, ensuring correct shape [batch, channels, height, width]
+        if len(state.shape) == 3 and state.shape[0] == 4:  # Already stacked frames in correct format
             state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
-            
-            # Get action from model
-            with torch.no_grad():
-                q_values = self.policy_net(state_tensor)
-                action = q_values.max(1)[1].item()
-            
-            if random.random() < self.epsilon:
-                # Random action with bias toward right movement (actions 1-4)
-                if random.random() < 0.9:  # 90% chance of right-moving action
-                    action = random.choice([2, 4])  # Right-moving actions
-                    if self.debug:
-                        print(f"Random RIGHT-BIASED action: {action}")
-                else:
-                    action = random.randint(0, self.n_actions - 1)
-                    if self.debug:
-                        print(f"Random action: {action}")
-            else:
+        else:  # Need to ensure correct shape
+            state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
+            if state_tensor.shape != torch.Size([1, 4, 84, 84]):
+                # Reshape if necessary to match expected input
+                state_tensor = state_tensor.reshape(1, 4, 84, 84)
+        
+        # Get action from model
+        with torch.no_grad():
+            q_values = self.policy_net(state_tensor)
+            action = q_values.max(1)[1].item()
+        
+        # Apply epsilon-greedy exploration
+        if random.random() < self.epsilon:
+            # Random action with bias toward right movement
+            if random.random() < 0.8:  # 80% chance of right-moving action
+                action = random.choice([1, 2, 4])  # Right-moving actions
                 if self.debug:
-                    print(f"Model action: {action}, Q-values min/max: {q_values.min().item():.2f}/{q_values.max().item():.2f}")
-                
-                # Track non-right actions
-                if action not in [2, 4]:
-                    self.non_right_count += 1
-                else:
-                    self.non_right_count = 0
-                
-                # Override with right movement if model seems stuck
-                if self.non_right_count >= self.max_non_right:
-                    action = random.choice([2, 4])  # Force right action
-                    self.non_right_count = 0
-                    if self.debug:
-                        print(f"Overriding with RIGHT action: {action} after {self.max_non_right} non-right actions")
-            
-            # Store the selected action for reuse
-            self.last_action = action
-            return action
-                    
-        except Exception as e:
+                    print(f"Random RIGHT-BIASED action: {action}")
+            else:
+                action = random.randint(0, self.n_actions - 1)
+                if self.debug:
+                    print(f"Random action: {action}")
+        else:
             if self.debug:
-                print(f"ERROR in act method: {e}")
-                import traceback
-                traceback.print_exc()
-            # In case of any error, just go right
-            action = 1  # right action
-            self.last_action = action
-            return action
+                print(f"Model action: {action}, Q-values min/max: {q_values.min().item():.2f}/{q_values.max().item():.2f}")
+            
+            # Track non-right actions
+            if action not in [1, 2, 3, 4]:  # Actions that move right
+                self.non_right_count += 1
+            else:
+                self.non_right_count = 0
+            
+            # Override with right movement if model seems stuck
+            if self.non_right_count >= self.max_non_right:
+                action = random.choice([1, 2, 4])  # Force right action
+                self.non_right_count = 0
+                if self.debug:
+                    print(f"Overriding with RIGHT action: {action} after {self.max_non_right} non-right actions")
+        
+        # Store the selected action
+        self.last_action = action
+        self.current_action = action
+        
+        # Count the actions we've selected
+        self.action_counter += 1
+        
+        return action
+                    
+
     
     def load_model(self, model_path):
         """Load trained model if it exists"""
