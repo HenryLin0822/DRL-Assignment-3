@@ -1,3 +1,4 @@
+#2738
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -132,7 +133,7 @@ class DuelingDQN(nn.Module):
 class Agent:
     def __init__(self, debug=False):
         # Debug flag for printing information
-        self.debug = debug
+        self.debug = True
         
         # Initialize parameters
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -148,7 +149,9 @@ class Agent:
         
         # Load model
         self.load_model("mario_model.pth")
+        #self.load_model("2738.pth")
         #self.load_model("./checkpoints/best_processed_mario_model.pth")
+        #self.load_model("./checkpoints/mario_rainbow_dqn_best.pth")
         
         # For exploration - use a higher epsilon for raw observations
         self.epsilon = 0.01  # Low epsilon to trust the model more
@@ -211,21 +214,19 @@ class Agent:
     def process_single_frame(self, frame):
         """
         Process a single raw frame to exactly match training preprocessing
-        Ensures bit-identical output to the wrapper pipeline
         """
-        # 1. Convert RGB to grayscale using OpenCV (same as GrayScaleObservation)
+        # Convert RGB to grayscale
         gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
         
-        # 2. Resize to 84x84 using skimage.transform (same as ResizeObservation wrapper)
-        resized = transform.resize(gray, (84, 84))
+        # Resize with the exact same parameters as wrapper
+        resized = transform.resize(gray, (84, 84), anti_aliasing=True)
         resized *= 255
         resized = resized.astype(np.uint8)
         
-        # 3. Normalize to [0, 1] range (same as TransformObservation)
-        normalized = resized / 255.0
+        # Normalize
+        normalized = resized.astype(np.float32) / 255.0
         
-        # Return as float32 for PyTorch compatibility
-        return normalized.astype(np.float32)
+        return normalized
             
     def preprocess_observation(self, observation):
         """Process observations to match training pipeline exactly"""
@@ -295,93 +296,96 @@ class Agent:
         """
         Select action based on observation.
         Handles both raw and processed observations with consistent behavior.
+        - Adds a small chance of selecting jump+right for exploration
+        - Detects when agent is stuck and forces a jump
+        Returns a single action integer.
         """
-       
-        # Process the observation first to get proper state for the neural network
-        state = self.preprocess_observation(observation)
+        # Small probability for random jump+right action (exploration)
+        epsilon = 0.01  # 5% chance to jump
         
-        # First frame of episode special handling
-        if self.is_first_frame:
-            self.reset_frame_stack()
-            self.is_first_frame = False
+        # Initialize stuck detection if needed
+        if not hasattr(self, 'last_positions'):
+            self.last_positions = []
+            self.stuck_counter = 0
+        
+        # Case 1: Already processed observations (4, 84, 84)
+        if isinstance(observation, np.ndarray) and observation.shape == (4, 84, 84):
+            # For processed observations, simply use the model
+            state_tensor = torch.FloatTensor(observation).unsqueeze(0).to(self.device)
+            with torch.no_grad():
+                q_values = self.policy_net(state_tensor)
+                action = q_values.max(1)[1].item()
             
-            # Always start with right (action index 1) after death/reset
-            self.current_action = 1  # right action
-            self.last_action = 1
-            if self.debug:
-                print("Starting new episode with right action")
-            return 1  # right action
-        
-        # Decide whether to select a new action or reuse previous one
-        if not self.should_select_new_action():
-            if self.debug:
-                print(f"Reusing action {self.current_action} (frame {self.frame_count % self.frame_skip} of {self.frame_skip})")
+            # Random chance to override with jump+right action
+            if random.random() < epsilon:
+                action = 2  # Action code for jump+right
+                
+            # Check if we're stuck (position not changing significantly)
+            if self.stuck_counter > 10:  # If stuck for too long
+                action = 2  # Force jump+right
+                self.stuck_counter = 0  # Reset counter
+                if self.debug:
+                    print("Detected stuck! Forcing jump action")
+            
+            return action
+            
+        # Case 2: Raw RGB observation (240, 256, 3)
+        if isinstance(observation, np.ndarray) and len(observation.shape) == 3 and observation.shape[2] == 3:
+            # Process the observation
+            processed_frame = self.process_single_frame(observation)
+            
+            # First frame special handling
+            if self.is_first_frame:
+                # Initialize stack with first frame
+                self.frame_stack.clear()
+                for _ in range(4):
+                    self.frame_stack.append(processed_frame.copy())
+                self.is_first_frame = False
+                
+                # Initialize position tracking
+                self.last_positions = []
+                self.stuck_counter = 0
+                
+                # For first frame, always start with right action
+                self.current_action = 1
+                self.frame_count = 0
+                return self.current_action
+            
+            # Only update frame stack and select new action every frame_skip frames
+            if self.frame_count % self.frame_skip == 0:
+                # Update frame stack with newest processed frame
+                self.frame_stack.append(processed_frame)
+                
+                # Create stacked state
+                stacked_state = np.array(list(self.frame_stack))
+                
+                # Select new action based on current stacked state
+                state_tensor = torch.FloatTensor(stacked_state).unsqueeze(0).to(self.device)
+                with torch.no_grad():
+                    q_values = self.policy_net(state_tensor)
+                    new_action = q_values.max(1)[1].item()
+                
+                # Random chance to override with jump+right action
+                if random.random() < epsilon:
+                    new_action = 2  # Action code for jump+right
+                
+                # Check if we're stuck (position not changing significantly)
+                if self.stuck_counter > 30:  # If stuck for too long
+                    new_action = 2  # Force jump+right
+                    self.stuck_counter = 0  # Reset counter
+                    if self.debug:
+                        print("Detected stuck! Forcing jump action")
+                    
+                self.current_action = new_action
+            
+            # Increment frame counter
+            self.frame_count += 1
+            
+            # Return current action (either new or reused)
             return self.current_action
         
-        # For raw observations at the start of an episode, use predetermined actions
-        if isinstance(observation, np.ndarray) and len(observation.shape) == 3 and observation.shape[2] == 3:
-            if self.start_action_idx < len(self.start_actions):
-                action = self.start_actions[self.start_action_idx]
-                if self.debug:
-                    print(f"Using start action #{self.start_action_idx}: {action}")
-                self.start_action_idx += 1
-                self.last_action = action
-                self.current_action = action
-                return action
-        
-        # Reset noise for the policy network to encourage exploration
-        self.policy_net.reset_noise()
-        
-        # Convert to tensor, ensuring correct shape [batch, channels, height, width]
-        if len(state.shape) == 3 and state.shape[0] == 4:  # Already stacked frames in correct format
-            state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
-        else:  # Need to ensure correct shape
-            state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
-            if state_tensor.shape != torch.Size([1, 4, 84, 84]):
-                # Reshape if necessary to match expected input
-                state_tensor = state_tensor.reshape(1, 4, 84, 84)
-        
-        # Get action from model
-        with torch.no_grad():
-            q_values = self.policy_net(state_tensor)
-            action = q_values.max(1)[1].item()
-        
-        # Apply epsilon-greedy exploration
-        if random.random() < self.epsilon:
-            # Random action with bias toward right movement
-            if random.random() < 0.8:  # 80% chance of right-moving action
-                action = random.choice([1, 2, 4])  # Right-moving actions
-                if self.debug:
-                    print(f"Random RIGHT-BIASED action: {action}")
-            else:
-                action = random.randint(0, self.n_actions - 1)
-                if self.debug:
-                    print(f"Random action: {action}")
-        else:
-            if self.debug:
-                print(f"Model action: {action}, Q-values min/max: {q_values.min().item():.2f}/{q_values.max().item():.2f}")
-            
-            # Track non-right actions
-            if action not in [1, 2, 3, 4]:  # Actions that move right
-                self.non_right_count += 1
-            else:
-                self.non_right_count = 0
-            
-            # Override with right movement if model seems stuck
-            if self.non_right_count >= self.max_non_right:
-                action = random.choice([1, 2, 4])  # Force right action
-                self.non_right_count = 0
-                if self.debug:
-                    print(f"Overriding with RIGHT action: {action} after {self.max_non_right} non-right actions")
-        
-        # Store the selected action
-        self.last_action = action
-        self.current_action = action
-        
-        # Count the actions we've selected
-        self.action_counter += 1
-        
-        return action
+        # Fallback case
+        return self.current_action  # Default to current action if observation format is unexpected
                     
 
     
