@@ -340,7 +340,7 @@ class Agent:
                 # Random chance to override with jump+right action
                 if random.random() < epsilon:
                     new_action = self.get_biased_random_action() 
-                    print(new_action)
+                    #print(new_action)
                 
                     
                 self.current_action = new_action
