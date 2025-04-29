@@ -398,4 +398,3 @@ class Agent:
             return random.choice(right_actions)
         
         return random.randint(0, 11 - 1)
-    
