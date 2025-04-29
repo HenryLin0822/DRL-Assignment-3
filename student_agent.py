@@ -1,4 +1,4 @@
-#2738
+#correct version
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -303,31 +303,6 @@ class Agent:
         # Small probability for random jump+right action (exploration)
         epsilon = 0.01  # 5% chance to jump
         
-        # Initialize stuck detection if needed
-        if not hasattr(self, 'last_positions'):
-            self.last_positions = []
-            self.stuck_counter = 0
-        
-        # Case 1: Already processed observations (4, 84, 84)
-        if isinstance(observation, np.ndarray) and observation.shape == (4, 84, 84):
-            # For processed observations, simply use the model
-            state_tensor = torch.FloatTensor(observation).unsqueeze(0).to(self.device)
-            with torch.no_grad():
-                q_values = self.policy_net(state_tensor)
-                action = q_values.max(1)[1].item()
-            
-            # Random chance to override with jump+right action
-            if random.random() < epsilon:
-                action = 2  # Action code for jump+right
-                
-            # Check if we're stuck (position not changing significantly)
-            if self.stuck_counter > 10:  # If stuck for too long
-                action = 2  # Force jump+right
-                self.stuck_counter = 0  # Reset counter
-                if self.debug:
-                    print("Detected stuck! Forcing jump action")
-            
-            return action
             
         # Case 2: Raw RGB observation (240, 256, 3)
         if isinstance(observation, np.ndarray) and len(observation.shape) == 3 and observation.shape[2] == 3:
@@ -342,9 +317,6 @@ class Agent:
                     self.frame_stack.append(processed_frame.copy())
                 self.is_first_frame = False
                 
-                # Initialize position tracking
-                self.last_positions = []
-                self.stuck_counter = 0
                 
                 # For first frame, always start with right action
                 self.current_action = 1
@@ -367,14 +339,9 @@ class Agent:
                 
                 # Random chance to override with jump+right action
                 if random.random() < epsilon:
-                    new_action = 2  # Action code for jump+right
+                    new_action = self.get_biased_random_action() 
+                    print(new_action)
                 
-                # Check if we're stuck (position not changing significantly)
-                if self.stuck_counter > 30:  # If stuck for too long
-                    new_action = 2  # Force jump+right
-                    self.stuck_counter = 0  # Reset counter
-                    if self.debug:
-                        print("Detected stuck! Forcing jump action")
                     
                 self.current_action = new_action
             
@@ -422,3 +389,12 @@ class Agent:
             if self.debug:
                 print(f"Error loading model: {e}")
             return False
+        
+    def get_biased_random_action(self, right_bias=0.7):
+        """Select a random action with bias towards moving right"""
+        right_actions = [1, 2, 3, 4]  # Indices for right-moving actions
+        
+        if random.random() < right_bias:
+            return random.choice(right_actions)
+        
+        return random.randint(0, 11 - 1)
